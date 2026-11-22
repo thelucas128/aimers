@@ -1,0 +1,38 @@
+[package]
+name = "rustudio-render"
+description = "GPU renderer, scene build, lighting, skinning and effects for rustudio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustudio-core = { path = "../rustudio-core" }
+# matpack's KTX2 pack fetch asks assetdelivery as the editor's session does
+# (agent(), PLACE_CONTEXT), the same way assets does; core already depends on
+# account, so this adds no crate to the build.
+rustudio-account = { path = "../rustudio-account" }
+# wgpu comes through egui-wgpu (`use egui_wgpu::wgpu`), the same wgpu the
+# editor's eframe surface uses: one wgpu in the graph, not a second copy.
+egui-wgpu = "0.36"
+# egui's TextureId / Rect / Pos2 / Context, which the renderer's API already
+# takes (render.rs, world_gui.rs, vf_render.rs, effects.rs, lighting.rs,
+# camera.rs, grass_temporal.rs).
+egui = "0.36"
+glam = { version = "0.30", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+rbx_dom_weak = "4"
+rustc-hash = "2"
+serde_json = { version = "1", features = ["preserve_order"] }
+# matpack's KTX2 / packed-map decoding, and grass_temporal's frame dumps.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+flate2 = "1"
+zstd = "0.13"
+# hsr's per-mesh content hash (the packed look's cache key).
+blake3 = "1"
+
+[dev-dependencies]
+rustudio-core = { path = "../rustudio-core", features = ["test-support"] }
+# render.rs's `gpu_tests` module builds a device on the machine's adapter,
+# and examples/dof_regression.rs runs a compute pass (an example builds with
+# the dev-dependencies).
+pollster = "0.4"

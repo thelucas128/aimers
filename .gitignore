@@ -1,0 +1,7 @@
+target/
+__pycache__/
+
+# aimers: logs, replays and the executor's file sandbox
+aimers-workspace/
+*.aimers.jsonl
+*.aimers.lua

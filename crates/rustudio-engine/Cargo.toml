@@ -1,0 +1,51 @@
+[package]
+name = "rustudio-engine"
+description = "Luau runtime, API domains, replication, GUI objects, audio and rigs for rustudio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustudio-core = { path = "../rustudio-core" }
+rustudio-physics = { path = "../rustudio-physics" }
+rustudio-render = { path = "../rustudio-render" }
+# The web-backed domains (avatar's appearance fetch, assets_cloud, web_social,
+# data_messaging) and the account session go through it. No cycle: account is
+# a leaf.
+rustudio-account = { path = "../rustudio-account" }
+mlua = { version = "0.12", features = ["luau"] }
+# theme.rs's dock_style and gui.rs's paint callback take egui's (and the dock's)
+# types; gui.rs hands the renderer egui_wgpu's RenderState.
+egui = "0.36"
+egui-wgpu = "0.36"
+egui_dock = "0.21"
+rbx_dom_weak = "4"
+rbx_binary = "3"
+rbx_xml = "3"
+rbx_reflection = "7"
+rbx_types = "3"
+glam = { version = "0.30", features = ["bytemuck"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+rustc-hash = "2"
+# EditableImage / EditableMesh texel and mesh reads, media_misc's image decode.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+flate2 = "1"
+# services domain: HttpService (real HTTP), EncodingService (zstd, hashes).
+ureq = "3"
+# HttpService:CreateWebStreamClient (WebSocket type).
+tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+zstd = "0.13"
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+blake2 = "0.10"
+blake3 = "1"
+chrono = { version = "0.4.35", default-features = false, features = ["clock"] }
+# audio / audio_capture / audio_dsp.
+rodio = { version = "0.23", default-features = false, features = ["playback", "vorbis", "mp3", "wav", "flac"] }
+libc = "0.2"
+# geometry_ops' convex hull (rapier's parry).
+rapier3d = { version = "0.36", features = ["parallel", "profiler"] }
+
+[dev-dependencies]
+rustudio-physics = { path = "../rustudio-physics", features = ["test-support"] }

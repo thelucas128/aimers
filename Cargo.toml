@@ -1,0 +1,51 @@
+[workspace]
+members = [
+    "crates/rustudio-account",
+    "crates/rustudio-core",
+    "crates/rustudio-physics",
+    "crates/rustudio-render",
+    "crates/rustudio-engine",
+    "crates/aimers",
+]
+default-members = ["crates/aimers"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.3.2"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# `cargo build --profile profiling` for perf: release speed with symbols.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+
+# Fast rebuilds: release optimisation in many small units that are reused
+# between builds, so a one-file change recompiles only what it touched.
+# Use: cargo build --profile agent   (binary: target/agent/aimers)
+[profile.agent]
+inherits = "release"
+incremental = true
+codegen-units = 256
+
+[patch.crates-io]
+rustls = { path = "vendor/rustls" }
+# Luau 745 (crates.io luau0-src 0.23.0+luau745): its compiler reuses dead
+# locals' registers, without which large obfuscated client scripts run out of
+# the 200 local registers. mlua-sys 0.13.0 is vendored only to accept it.
+luau0-src = { path = "vendor/luau0-src" }
+mlua-sys = { path = "vendor/mlua-sys" }
+parry3d = { path = "vendor/parry3d" }
+# mlua 0.12.2 + Lua::with_current_state: the direct Instance bridge calls
+# Rust from raw C functions and must make the calling Lua thread mlua's
+# current one.
+mlua = { path = "vendor/mlua" }
+egui = { path = "vendor/egui" }
+rbx_dom_weak = { path = "vendor/rbx_dom_weak" }
+rapier3d = { path = "vendor/rapier3d" }

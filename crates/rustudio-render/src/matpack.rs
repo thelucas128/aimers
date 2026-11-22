@@ -1,0 +1,1231 @@
+//! Part material textures: Studio's material tables and their texture packs.
+//!
+//! Studio builds three tables of 43 materials in one function
+//! `PartMaterialInfosPre2022`, then either the 4K 2022 table
+//! (fast flag RenderEnablePartBaseMaterial4K, default true, registered at
+//!) or the plain 2022 table. Each entry is a texture pack id
+//! (colour / normal / roughness or metalness / height), a second "detail"
+//! pack (a normal map only), a colour 0xAABBGGRR and one 16-bit word. The
+//! colour is the material's average: drawn on its own when the maps aren't
+//! there (offline Studio shows exactly these, squared), and close to the
+//! colour map's mean (pre-2022 Fabric 0x666869 vs 101, 100, 98 measured).
+//! Material order: the Enum.Material list.
+//!
+//! A pack is fetched from public asset delivery (docs/MATERIALS.md: no login,
+//! gzip, two hops), its maps decoded, resized to one layer size and turned
+//! into mip chains on background threads; results are cached by asset id
+//! in ~/.cache/rustudio/assets. Studio's part shaders sample every map at
+//! TEXCOORD0 × uvScale + uvOffset (DefaultUnified*VS, per-instance CB1 rows
+//! 5 and 6): a box face repeats every `consts(..)[5]` studs (8 with the 2022
+//! tables, 4–14.8 per material with the pre-2022 one; measured, mech.rs
+//! PART_MATERIAL_*), times the shader's textureTiling. The material's second
+//! ("detail") pack is a normal map added at `normalDetailTiling` times the
+//! main repeat; 2022 materials of shader type 21 are drawn "detiled" (two
+//! copies at noise-picked offsets).
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+/// One material's row of a Studio material table. `detail` is the detail
+/// normal pack (drawn with `consts`); `word` is kept as read, not drawn.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct Entry {
+    pub material: u32,
+    /// Texture pack asset id (0: none, the material draws flat).
+    pub pack: u64,
+    /// The second pack: a detail normal map (0: none).
+    pub detail: u64,
+    /// Average colour, 0xAABBGGRR.
+    pub color: u32,
+    /// The entry's last 16-bit field (meaning not identified).
+    pub word: u16,
+}
+
+const fn e(material: u32, pack: u64, detail: u64, color: u32, word: u16) -> Entry {
+    Entry {
+        material,
+        pack,
+        detail,
+        color,
+        word,
+    }
+}
+
+/// RenderEnablePartBaseMaterial4K's default.
+pub const PART_BASE_MATERIAL_4K: bool = true;
+/// Studs per texture repeat of the 2022 tables (and of the studs atlas:
+/// TEXCOORD0 = studs / 8); the pre-2022 table's are per material (`consts`).
+pub const STUDS_PER_TILE: f32 = 8.0;
+/// Every map is resized to this square layer size for the texture arrays.
+pub const LAYER_SIZE: u32 = 1024;
+
+pub static PRE_2022: [Entry; 43] = [
+    e(256, 0, 0, 0xffffffff, 0x9900),                    // Plastic
+    e(272, 0, 0, 0xffffffff, 0x3c00),                    // SmoothPlastic
+    e(1328, 9439632387, 9438453972, 0xffdadada, 0x7d00), // Snow
+    e(912, 9873521380, 9438453972, 0xf6a9abae, 0xc100),  // Sandstone
+    e(288, 0, 0, 0xffffffff, 0x8000),                    // Neon
+    e(512, 7547303225, 7547298786, 0xffe3e3e3, 0x8816),  // Wood
+    e(528, 7547332968, 7546645118, 0xffcbd1d4, 0xa93d),  // WoodPlanks
+    e(784, 7547177270, 7546645118, 0xffc7c7c7, 0x7d00),  // Marble
+    e(800, 7547298114, 7547298323, 0xffc1c1c1, 0x8c00),  // Slate
+    e(816, 7546653951, 7546654144, 0xffd0d0d0, 0x8300),  // Concrete
+    e(832, 7547164710, 7546645118, 0xff717171, 0x9500),  // Granite
+    e(848, 7546650097, 7546645118, 0xe8c8c9cc, 0xfc00),  // Brick
+    e(864, 7547291361, 7546645118, 0xffd0d0d0, 0x9900),  // Pebble
+    e(1040, 7547184629, 7546645118, 0xc85f779f, 0xba86), // CorrodedMetal
+    e(1056, 7547162198, 7546645118, 0xffaaaaaa, 0x61a8), // DiamondPlate
+    e(1072, 7546645012, 7546645118, 0xffffffff, 0x2bff), // Foil
+    e(1088, 7547288171, 7546645118, 0xffc7c7c7, 0x59ca), // Metal
+    e(1280, 7547169285, 7546645118, 0xff9fa5a5, 0xcd00), // Grass
+    e(1296, 7547295153, 7546645118, 0xffdcdcdc, 0x8800), // Sand
+    e(1312, 7547101130, 7546645118, 0xf4666869, 0xef00), // Fabric
+    e(1536, 7547171356, 7546645118, 0xffffffff, 0x2d00), // Ice
+    e(880, 7546652947, 7546645118, 0xfabbc8d4, 0x8000),  // Cobblestone
+    e(1568, 7547304948, 7546645118, 0x07fefefe, 0x1d00), // Glass
+    e(1584, 0, 0, 0xffffffff, 0x8000),                   // ForceField
+    e(1344, 9873319819, 9438453972, 0xfc828282, 0x8800), // Mud
+    e(820, 9873289812, 9438453972, 0xfae6eaeb, 0xaa00),  // Limestone
+    e(788, 9873270487, 9438413638, 0xee999a9a, 0xcf00),  // Basalt
+    e(1360, 9439044431, 9438453972, 0xf0707272, 0xe700), // Ground
+    e(1284, 9873288083, 9438453972, 0xea717579, 0xe900), // LeafyGrass
+    e(896, 9873515198, 9438453972, 0xf89a9a9a, 0xb100),  // Rock
+    e(836, 9873322398, 9438453972, 0xec908e8e, 0xc300),  // Pavement
+    e(1552, 9438851661, 9438453972, 0xf3e5e5e2, 0x6400), // Glacier
+    e(804, 9438582231, 9438453972, 0x9c504e4a, 0xbc00),  // CrackedLava
+    e(1392, 9439566986, 9438453972, 0xffdddcdc, 0xa200), // Salt
+    e(1376, 9873267379, 9438410548, 0xea7b7b7b, 0xdf00), // Asphalt
+    e(2304, 14108654559, 0, 0xffa9a9a9, 0xab00),         // Cardboard
+    e(2305, 14108663921, 0, 0xe5cecece, 0xcd00),         // Carpet
+    e(2306, 17429458668, 0, 0xfaefefef, 0x4300),         // CeramicTiles
+    e(2307, 18147685875, 0, 0xff9a9a9a, 0x8600),         // ClayRoofTiles
+    e(2308, 91579661064923, 0, 0xffacb6b5, 0xc200),      // RoofShingles
+    e(2309, 14108671010, 0, 0xffe1e1e1, 0x7600),         // Leather
+    e(2310, 14108672569, 0, 0xffdcdcdc, 0xf200),         // Plaster
+    e(2311, 14108675388, 0, 0xffd1d1d1, 0x932f),         // Rubber
+];
+pub static Y2022_4K: [Entry; 43] = [
+    e(256, 0, 83066014297293, 0xffffffff, 0x9900), // Plastic
+    e(272, 0, 0, 0xffffffff, 0x3c00),              // SmoothPlastic
+    e(1328, 106058971152252, 9438453972, 0xfff0efef, 0x7900), // Snow
+    e(912, 109869731739139, 9438453972, 0xf6e8e9f0, 0xbe00), // Sandstone
+    e(288, 0, 0, 0xffffffff, 0x8000),              // Neon
+    e(512, 73489845523797, 104555143962180, 0xffd3d3d9, 0xa200), // Wood
+    e(528, 78212019144684, 9438453972, 0xfecfd1d1, 0x8f00), // WoodPlanks
+    e(784, 104749709354369, 9438453972, 0xf8c1b7b4, 0x6e00), // Marble
+    e(800, 130174615834794, 75747241361350, 0xfdebebeb, 0x9300), // Slate
+    e(816, 115089551732435, 9438453972, 0xffe0e0e0, 0xb500), // Concrete
+    e(832, 125518382244973, 9438453972, 0xffc8ccd0, 0x2800), // Granite
+    e(848, 85077012310177, 9438453972, 0xe3cdd6e6, 0x9800), // Brick
+    e(864, 87820215580582, 9438453972, 0xebcbcdcd, 0xd700), // Pebble
+    e(1040, 122577965407434, 104387492555360, 0xb3a4b2cf, 0x9b29), // CorrodedMetal
+    e(1056, 124320368131155, 9438453972, 0xffd2d2d2, 0x56ff), // DiamondPlate
+    e(1072, 110583221457338, 136319143816079, 0xffeeeeee, 0x3cff), // Foil
+    e(1088, 71003343637114, 9438453972, 0xffe3e3e3, 0x2dff), // Metal
+    e(1280, 106637943980559, 9438453972, 0xf3c4c6c9, 0xe800), // Grass
+    e(1296, 117101875286338, 9438453972, 0xefc7ced1, 0xbe00), // Sand
+    e(1312, 132264823269423, 9438453972, 0xffe0e0e0, 0xdf00), // Fabric
+    e(1536, 91952184132897, 9438453972, 0xf8f1efeb, 0x6600), // Ice
+    e(880, 129616831094994, 9438453972, 0xf4dbdbdb, 0xe600), // Cobblestone
+    e(1568, 88609722573469, 9438453972, 0x07ffffff, 0x1d00), // Glass
+    e(1584, 0, 0, 0xffffffff, 0x8000),             // ForceField
+    e(1344, 81832637858593, 9438453972, 0xfbbcbcbd, 0x8800), // Mud
+    e(820, 136792039489433, 9438453972, 0xfbecf4f8, 0xae00), // Limestone
+    e(788, 103124999245988, 103955051687847, 0xefa0a2a2, 0xd200), // Basalt
+    e(1360, 122356188009715, 9438453972, 0xf39ea3a3, 0xe800), // Ground
+    e(1284, 75665810846977, 9438453972, 0xebb4b4b8, 0xeb00), // LeafyGrass
+    e(896, 112102163340384, 9438453972, 0xf9d2d3d4, 0xc200), // Rock
+    e(836, 100821413010093, 9438453972, 0xebd8dad9, 0xc200), // Pavement
+    e(1552, 85752927082668, 9438453972, 0xf3e5e5e2, 0x6400), // Glacier
+    e(804, 121276091081821, 9438453972, 0xf77d7d7c, 0xa400), // CrackedLava
+    e(1392, 137066264708856, 9438453972, 0xfff7f7f7, 0xa300), // Salt
+    e(1376, 77679553820203, 105970962053043, 0xebe6e5e4, 0xe000), // Asphalt
+    e(2304, 112994935967349, 0, 0xffa6a6a6, 0xab00), // Cardboard
+    e(2305, 119478636506120, 0, 0xe5cdcdcd, 0xcd00), // Carpet
+    e(2306, 126380627739075, 0, 0xfbefefef, 0x4a00), // CeramicTiles
+    e(2307, 114168170326154, 0, 0xffafaeae, 0xa500), // ClayRoofTiles
+    e(2308, 107847976513485, 0, 0xffc4cbca, 0xd300), // RoofShingles
+    e(2309, 111918862958038, 0, 0xffe2e2e2, 0x7500), // Leather
+    e(2310, 104555660139073, 0, 0xffdbdbdb, 0xed00), // Plaster
+    e(2311, 112374357118714, 0, 0xffdbdbdb, 0xed2f), // Rubber
+];
+pub static Y2022: [Entry; 43] = [
+    e(256, 0, 9475422736, 0xffffffff, 0x9900), // Plastic
+    e(272, 0, 0, 0xffffffff, 0x3c00),          // SmoothPlastic
+    e(1328, 9920620451, 9438453972, 0xfff0f0ef, 0x7d00), // Snow
+    e(912, 9920596353, 9438453972, 0xf6e6eaf1, 0xc100), // Sandstone
+    e(288, 0, 0, 0xffffffff, 0x8000),          // Neon
+    e(512, 9920625499, 9439649548, 0xffd0d1d9, 0xa000), // Wood
+    e(528, 9920626896, 9438453972, 0xfeced0cf, 0x8d00), // WoodPlanks
+    e(784, 9873292869, 9438453972, 0xf9c1b7b5, 0x6e00), // Marble
+    e(800, 9920600052, 9439613006, 0xfeebeaeb, 0x9400), // Slate
+    e(816, 9920484334, 9438453972, 0xffe0e1e1, 0xb500), // Concrete
+    e(832, 9920550720, 9438453972, 0xffc8ced2, 0x2800), // Granite
+    e(848, 9920482992, 9438453972, 0xe3cdd6e5, 0x9700), // Brick
+    e(864, 9920581197, 9438453972, 0xeac9cbcc, 0xd500), // Pebble
+    e(1040, 9920589512, 9439557520, 0xb4a3b1ce, 0x9928), // CorrodedMetal
+    e(1056, 10237721036, 9438453972, 0xffd2d2d2, 0x56ff), // DiamondPlate
+    e(1072, 9873266399, 9438410239, 0xffeeeeee, 0x3cff), // Foil
+    e(1088, 9920574966, 9438453972, 0xffe2e2e2, 0x2eff), // Metal
+    e(1280, 9920552044, 9438453972, 0xf1bdc4c4, 0xe700), // Grass
+    e(1296, 9920591862, 9438453972, 0xf0d2d8da, 0xbe00), // Sand
+    e(1312, 9920517963, 9438453972, 0xffdddddd, 0xe500), // Fabric
+    e(1536, 9920556429, 9438453972, 0xf8f1efeb, 0x6400), // Ice
+    e(880, 9919719550, 9438453972, 0xf3dbdbda, 0xde00), // Cobblestone
+    e(1568, 9873284556, 9438453972, 0x07fefefe, 0x1d00), // Glass
+    e(1584, 0, 0, 0xffffffff, 0x8000),         // ForceField
+    e(1344, 9920578676, 9438453972, 0xfcc1c0c1, 0x8800), // Mud
+    e(820, 9920561624, 9438453972, 0xfaf3f8fa, 0xaa00), // Limestone
+    e(788, 9920482224, 9438413638, 0xee9ea0a0, 0xcf00), // Basalt
+    e(1360, 9920554695, 9438453972, 0xf0a0a5a5, 0xe700), // Ground
+    e(1284, 9920558145, 9438453972, 0xeaafb2b6, 0xe900), // LeafyGrass
+    e(896, 10129366149, 9438453972, 0xf8d2d3d3, 0xb100), // Rock
+    e(836, 9920580094, 9438453972, 0xecdbdada, 0xc300), // Pavement
+    e(1552, 9920518995, 9438453972, 0xf3e5e5e1, 0x6400), // Glacier
+    e(804, 9920485426, 9438453972, 0x9c514f4c, 0xbc00), // CrackedLava
+    e(1392, 9920590478, 9438453972, 0xfff9f9f9, 0xa200), // Salt
+    e(1376, 9930003180, 9438410548, 0xeae4e3e3, 0xdf00), // Asphalt
+    e(2304, 14108654559, 0, 0xffa9a9a9, 0xab00), // Cardboard
+    e(2305, 14108663921, 0, 0xe5cecece, 0xcd00), // Carpet
+    e(2306, 17429458668, 0, 0xfaefefef, 0x4300), // CeramicTiles
+    e(2307, 18147685875, 0, 0xff9a9a9a, 0x8600), // ClayRoofTiles
+    e(2308, 91579661064923, 0, 0xffacb6b5, 0xc200), // RoofShingles
+    e(2309, 14108671010, 0, 0xffe1e1e1, 0x7600), // Leather
+    e(2310, 14108672569, 0, 0xffdcdcdc, 0xf200), // Plaster
+    e(2311, 14108675388, 0, 0xffd1d1d1, 0x932f), // Rubber
+];
+/// The table Studio draws parts with: MaterialService.Use2022Materials picks
+/// a 2022 table (4K by default), false the pre-2022 one.
+pub fn table(use2022: bool) -> &'static [Entry; 43] {
+    match (use2022, PART_BASE_MATERIAL_4K) {
+        (false, _) => &PRE_2022,
+        (true, true) => &Y2022_4K,
+        (true, false) => &Y2022,
+    }
+}
+
+pub fn entry(material: u32, use2022: bool) -> Option<&'static Entry> {
+    table(use2022).iter().find(|e| e.material == material)
+}
+
+/// Studio's per-material shader constants for a part (mech.rs
+/// PART_MATERIAL_*): textureTiling, normalDetailTiling, normalDetailScale,
+/// noiseScale, detiled (1/0), studs per tile. Unknown materials: plain
+/// tiling every STUDS_PER_TILE studs.
+pub fn consts(material: u32, use2022: bool) -> [f32; 6] {
+    let rows = if use2022 {
+        &rustudio_core::mech::PART_MATERIAL_2022
+    } else {
+        &rustudio_core::mech::PART_MATERIAL_PRE2022
+    };
+    table(use2022)
+        .iter()
+        .position(|e| e.material == material)
+        .map(|i| rows[i])
+        .unwrap_or([1.0, 0.0, 0.0, 0.0, 0.0, STUDS_PER_TILE])
+}
+
+/// Full type/constant row for a loaded pack. Packs identify the table even
+/// when old and new materials coexist; detail layers keep neutral defaults.
+pub fn full_consts(pack: u64) -> Option<&'static [f32; 21]> {
+    for (entries, rows) in [
+        (&PRE_2022, &rustudio_core::mech::PART_MATERIAL_FULL_PRE2022),
+        (&Y2022, &rustudio_core::mech::PART_MATERIAL_FULL_2022),
+        (&Y2022_4K, &rustudio_core::mech::PART_MATERIAL_FULL_2022),
+    ] {
+        if let Some(i) = entries.iter().position(|e| e.pack != 0 && e.pack == pack) {
+            return Some(&rows[i]);
+        }
+    }
+    None
+}
+
+/// Wang index is DDS A8L8, uploaded by Studio as two channels (L, A).
+/// Four 4-bit cells per f32, all integers exactly representable; the shader
+/// uses nearest/wrap, matching slot 9's filter=0.
+pub fn wang_index() -> Vec<[f32; 4]> {
+    let mut out = vec![[0.0; 4]; 1024];
+    let img = rustudio_core::assets::resolve(rustudio_core::mech::WANG_INDEX, None)
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|b| rustudio_core::texture::decode(&b).ok());
+    if let Some(img) = img.filter(|i| i.width == 128 && i.height == 128) {
+        for (i, px) in img.pixels.chunks_exact(4).enumerate() {
+            let cell = (px[0] / 64) as u32 | (((px[3] / 64) as u32) << 2);
+            out[i / 16][(i / 4) % 4] += (cell << ((i % 4) * 4)) as f32;
+        }
+    }
+    out
+}
+
+/// hashes an instance allocation's eight address bytes with
+/// FNV-1a; turns the hash into the part's offset. The renderer
+/// supplies a stable random referent identity in place of Studio's address.
+pub fn uv_offset(size: glam::Vec3, material: u32, identity: u64) -> [f32; 2] {
+    let hash = identity.to_le_bytes().iter().fold(rustudio_core::mech::MATERIAL_UV_FNV_OFFSET,
+        |h, b| (h ^ *b as u64).wrapping_mul(rustudio_core::mech::MATERIAL_UV_FNV_PRIME));
+    let u = ((hash >> 3) & 63) as usize;
+    let v = ((hash >> 9) & 63) as usize;
+    if matches!(material, 256 | 272) {
+        return [(u & !1) as f32, (v & !1) as f32];
+    }
+    if matches!(material, 528 | 848 | 2304..=2311) {
+        return [u as f32, v as f32];
+    }
+    let k = (size.x + size.y + size.z) * 0.5;
+    [u, v].map(|i| (rustudio_core::mech::MATERIAL_UV_RANDOM[i] * 2.0 - 1.0) * k)
+}
+
+/// Studio's detiling noise (mech::DETILE_NOISE, 32 × 32): its red channel,
+/// 0..1, rows top to bottom; flat 0 without the file.
+pub fn detile_noise() -> &'static [f32; 1024] {
+    static N: OnceLock<[f32; 1024]> = OnceLock::new();
+    N.get_or_init(|| {
+        let mut out = [0.0f32; 1024];
+        let img = rustudio_core::assets::resolve(rustudio_core::mech::DETILE_NOISE, None)
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| rustudio_core::texture::decode(&b).ok());
+        if let Some(img) = img.filter(|i| i.width == 32 && i.height == 32) {
+            for (i, v) in out.iter_mut().enumerate() {
+                *v = img.pixels[i * 4] as f32 / 255.0;
+            }
+        }
+        out
+    })
+}
+
+/// The table colour as RGB bytes (it is stored 0xAABBGGRR).
+pub fn rgb(color: u32) -> [u8; 3] {
+    [color as u8, (color >> 8) as u8, (color >> 16) as u8]
+}
+
+/// A material's colour without its maps, linear (squared, as Studio's
+/// shaders square their inputs): what the part colour is multiplied by.
+pub fn fallback_albedo(material: u32, use2022: bool) -> [f32; 3] {
+    match entry(material, use2022) {
+        Some(e) => rgb(e.color).map(|c| (c as f32 / 255.0).powi(2)),
+        None => [1.0; 3],
+    }
+}
+
+/// A pack's decoded maps: two RGBA8 mip chains and scalar height and
+/// emission mip chains. `albedo`: colour RGB and its alpha tint mask (not
+/// height). `surface`: normal X/Y (OpenGL convention), roughness, metalness.
+pub struct Pixels {
+    pub albedo: Vec<u8>,
+    pub surface: Vec<u8>,
+    /// Linear height mip chain, independent of the part tint mask.
+    pub height: Vec<u8>,
+    /// Scalar emissive mask, linear R8 mip chain.
+    pub emissive: Vec<u8>,
+    _held: Held,
+}
+
+/// Built maps not released yet, counted: the pack workers pause above
+/// HELD_LIMIT packs (a long first frame otherwise had every pack of the
+/// place built and waiting for its upload, most of a GB).
+static HELD: AtomicU64 = AtomicU64::new(0);
+const HELD_LIMIT: u64 = 8;
+
+struct Held;
+
+impl Held {
+    fn new() -> Held {
+        HELD.fetch_add(1, Ordering::Relaxed);
+        Held
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        HELD.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A built pack. Its maps (14 MB at 1024²) stay in memory only until the
+/// renderer has them in its texture arrays (`release_pixels`); what needs
+/// them again asks `request_pixels` and the pack is built again from the
+/// asset cache. A place with terrain and a few dozen materials held 1 GB of
+/// them for good. The small `preview` and `mean` always stay.
+pub struct Maps {
+    pub pack: u64,
+    pub tiling: f32,
+    /// Which maps the pack had: colour, normal, roughness, metalness, height.
+    pub found: [bool; 5],
+    /// The colour chain from its PREVIEW_SIZE² level down (`preview_levels`).
+    pub preview: Vec<u8>,
+    /// Mean colour of the top level (gamma 2.2 mean), for `mean_albedo`.
+    pub mean: [f32; 3],
+    color: u32,
+    pixels: Mutex<Option<Arc<Pixels>>>,
+}
+
+/// Side of the largest colour level kept in `Maps::preview`.
+pub const PREVIEW_SIZE: u32 = 256;
+
+/// Byte offset and size of each level in `Maps::preview`.
+pub fn preview_levels() -> Vec<(usize, u32)> {
+    let levels = mip_levels();
+    let first = levels.iter().position(|(_, s)| *s <= PREVIEW_SIZE).unwrap_or(0);
+    levels[first..].iter().map(|(at, s)| (at - levels[first].0, *s)).collect()
+}
+
+impl Maps {
+    fn new(pack: u64, found: [bool; 5], color: u32, pixels: Pixels) -> Maps {
+        let from = mip_levels().into_iter().find(|(_, s)| *s <= PREVIEW_SIZE).map_or(0, |(at, _)| at);
+        Maps {
+            pack,
+            // Texture-pack <tiling> is a 0..2 layout enum, not a UV scale
+            //. In particular legacy Wang packs use 2.
+            // Repeat density comes from uvScale and PartMaterialConsts instead.
+            tiling: 1.0,
+            found,
+            preview: pixels.albedo.get(from..).unwrap_or_default().to_vec(),
+            mean: top_level_mean(&pixels.albedo),
+            color,
+            pixels: Mutex::new(Some(Arc::new(pixels))),
+        }
+    }
+
+    /// The maps, while they are held (see `Maps`).
+    pub fn pixels(&self) -> Option<Arc<Pixels>> {
+        self.pixels.lock().expect("pack pixels").clone()
+    }
+
+    /// The maps are on the GPU: drop them here.
+    pub fn release_pixels(&self) {
+        self.pixels.lock().expect("pack pixels").take();
+    }
+}
+
+/// Builds a released pack's maps again (nothing when they are held or
+/// already on their way); `generation` changes when they are back.
+pub fn request_pixels(maps: &Maps) {
+    if maps.pixels.lock().expect("pack pixels").is_some() {
+        return;
+    }
+    let s = store();
+    if !s.rebuilding.lock().expect("material rebuilds").insert(maps.pack) {
+        return;
+    }
+    s.queue.lock().expect("material queue").push_back((maps.pack, maps.color, true));
+    s.wake.notify_one();
+}
+
+#[derive(Clone)]
+enum State {
+    Pending,
+    Ready(Arc<Maps>),
+    Failed(String),
+}
+
+struct Store {
+    states: Mutex<HashMap<u64, State>>,
+    /// (pack, colour, keep the maps for the renderer)
+    queue: Mutex<VecDeque<(u64, u32, bool)>>,
+    /// Packs first asked for their preview only, then by the renderer
+    /// while still being built.
+    wanted: Mutex<std::collections::HashSet<u64>>,
+    /// Released packs being built again (`request_pixels`).
+    rebuilding: Mutex<std::collections::HashSet<u64>>,
+    wake: Condvar,
+    /// Bumped whenever a pack finishes (or fails), so draws are rebuilt.
+    generation: AtomicU64,
+}
+
+fn store() -> &'static Store {
+    static S: OnceLock<Store> = OnceLock::new();
+    S.get_or_init(|| {
+        for _ in 0..2 {
+            std::thread::Builder::new()
+                .name("material packs".into())
+                .spawn(|| loop {
+                    let (pack, color, keep) = {
+                        let s = store();
+                        let mut q = s.queue.lock().expect("material queue");
+                        loop {
+                            if let Some(j) = q.pop_front() {
+                                break j;
+                            }
+                            q = s.wake.wait(q).expect("material queue");
+                        }
+                    };
+                    // (at most 3 s: maps nothing uploads, as in tests or with
+                    // their parts gone, must not hold up the rest)
+                    let t0 = std::time::Instant::now();
+                    while !cfg!(test) && HELD.load(Ordering::Relaxed) >= HELD_LIMIT && t0.elapsed().as_secs() < 3 {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    let built = build(pack, color);
+                    let s = store();
+                    let keep = s.wanted.lock().expect("material wants").remove(&pack) | keep;
+                    let again = s.rebuilding.lock().expect("material rebuilds").remove(&pack);
+                    let mut states = s.states.lock().expect("material states");
+                    match (built, states.get(&pack)) {
+                        // Built again for the renderer: the same Maps gets its pixels back.
+                        (Ok(m), Some(State::Ready(old))) if again => {
+                            *old.pixels.lock().expect("pack pixels") = m.pixels();
+                        }
+                        (Err(_), Some(State::Ready(_))) if again => {}
+                        (Ok(m), _) => {
+                            if !keep {
+                                m.release_pixels();
+                            }
+                            states.insert(pack, State::Ready(Arc::new(m)));
+                        }
+                        (Err(e), _) => {
+                            states.insert(pack, State::Failed(e));
+                        }
+                    }
+                    drop(states);
+                    s.generation.fetch_add(1, Ordering::Relaxed);
+                })
+                .ok();
+        }
+        Store {
+            states: Mutex::new(HashMap::new()),
+            queue: Mutex::new(VecDeque::new()),
+            wanted: Mutex::new(Default::default()),
+            rebuilding: Mutex::new(Default::default()),
+            wake: Condvar::new(),
+            generation: AtomicU64::new(0),
+        }
+    })
+}
+
+pub enum Lookup {
+    Ready(Arc<Maps>),
+    Pending,
+    Unavailable(String),
+}
+
+/// A table entry's maps: ready, being fetched (queued on first ask), or
+/// unavailable (no pack, or the fetch failed).
+pub fn maps(e: &Entry) -> Lookup {
+    pack_maps(e.pack, e.color)
+}
+
+/// A pack's maps by id (terrain packs, round 21): as `maps`; `color` stands
+/// in for a pack without a colour map.
+pub fn pack_maps(pack: u64, color: u32) -> Lookup {
+    lookup(pack, color, true)
+}
+
+/// As `pack_maps` for what only reads `Maps::preview` / `mean` (thumbnails):
+/// the full maps are not kept for it.
+pub fn pack_preview(pack: u64, color: u32) -> Lookup {
+    lookup(pack, color, false)
+}
+
+fn lookup(pack: u64, color: u32, keep: bool) -> Lookup {
+    if PACKS_OFF.load(Ordering::Relaxed) {
+        return Lookup::Unavailable("material packs are switched off".into());
+    }
+    if pack == 0 {
+        return Lookup::Unavailable("the material has no texture pack".into());
+    }
+    let e = e(0, pack, 0, color, 0);
+    let s = store();
+    let mut states = s.states.lock().expect("material states");
+    match states.get(&e.pack) {
+        Some(State::Ready(m)) => Lookup::Ready(m.clone()),
+        Some(State::Pending) => {
+            if keep {
+                s.wanted.lock().expect("material wants").insert(e.pack);
+            }
+            Lookup::Pending
+        }
+        Some(State::Failed(why)) => Lookup::Unavailable(why.clone()),
+        None => {
+            states.insert(e.pack, State::Pending);
+            drop(states);
+            s.queue
+                .lock()
+                .expect("material queue")
+                .push_back((e.pack, e.color, keep));
+            s.wake.notify_one();
+            Lookup::Pending
+        }
+    }
+}
+
+static PACKS_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// RUSTUDIO_MATPACKS=0 turns material packs (parts and terrain) off for the
+/// run: test runs compared with the offline Studio, which can't load them.
+pub fn init_from_env() {
+    if std::env::var("RUSTUDIO_MATPACKS").is_ok_and(|v| v == "0") {
+        set_enabled(false);
+    }
+}
+
+/// Draws materials with their flat table colours (packs off) or their
+/// texture packs. The self-test's lighting steps compare against Studio
+/// captured offline (offline Studio can't download packs), so they switch them off.
+pub fn set_enabled(on: bool) {
+    if PACKS_OFF.swap(!on, Ordering::Relaxed) == on {
+        store().generation.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Material packs are on (RUSTUDIO_MATPACKS isn't 0).
+pub fn enabled() -> bool {
+    !PACKS_OFF.load(Ordering::Relaxed)
+}
+
+/// Changes whenever a pack finished loading or failed.
+pub fn generation() -> u64 {
+    store().generation.load(Ordering::Relaxed)
+}
+
+/// Blocks until a pack is ready or failed (tests).
+#[cfg(test)]
+pub fn wait(e: &Entry, timeout: std::time::Duration) -> Lookup {
+    let t0 = std::time::Instant::now();
+    loop {
+        match maps(e) {
+            Lookup::Pending if t0.elapsed() < timeout => {
+                std::thread::sleep(std::time::Duration::from_millis(50))
+            }
+            other => return other,
+        }
+    }
+}
+
+fn image(id: u64) -> Result<rustudio_core::texture::Rgba, String> {
+    let bytes = rustudio_core::assets::public_cached(id)?;
+    let img = rustudio_core::texture::decode(&bytes).map_err(|e| format!("image {id}: {e}"))?;
+    Ok(resized(img, LAYER_SIZE))
+}
+
+fn resized(img: rustudio_core::texture::Rgba, size: u32) -> rustudio_core::texture::Rgba {
+    if img.width == size && img.height == size {
+        return img;
+    }
+    let Some(buf) = image::RgbaImage::from_raw(img.width, img.height, img.pixels) else {
+        return rustudio_core::texture::Rgba {
+            width: size,
+            height: size,
+            pixels: vec![255; (size * size * 4) as usize],
+        };
+    };
+    let out = image::imageops::resize(&buf, size, size, image::imageops::FilterType::Triangle);
+    rustudio_core::texture::Rgba {
+        width: size,
+        height: size,
+        pixels: out.into_raw(),
+    }
+}
+
+fn build(pack_id: u64, color: u32) -> Result<Maps, String> {
+    let (found, pixels) = build_pixels(pack_id, color)?;
+    Ok(Maps::new(pack_id, found, color, pixels))
+}
+
+/// Key bit: the terrain view of a pack (`terrain_pack_maps`).
+const TERRAIN_BIT: u64 = 1 << 63;
+
+fn build_pixels(pack_id: u64, color: u32) -> Result<([bool; 5], Pixels), String> {
+    if pack_id & TERRAIN_BIT != 0 {
+        let (found, mut terrain) = build_pixels(pack_id & !TERRAIN_BIT, color)?;
+        // The tint mask (colour alpha) moves to the surface map's alpha
+        // (metalness, unused by terrain) for CB4's tint form.
+        for (s, a) in terrain.surface.chunks_exact_mut(4).zip(terrain.albedo.chunks_exact(4)) {
+            s[3] = a[3];
+        }
+        for (pixel, height) in terrain.albedo.chunks_exact_mut(4).zip(&terrain.height) {
+            pixel[3] = *height;
+        }
+        return Ok((found, terrain));
+    }
+    if pack_id & rustudio_core::texture_pack::ACR_BIT != 0 {
+        // Studio's own terrain textures, else the pack's maps.
+        let base = pack_id & !rustudio_core::texture_pack::ACR_BIT;
+        return build_acr(base).or_else(|why| {
+            eprintln!("terrain pack {base}: {why}; using its maps");
+            build_pixels(base, color)
+        });
+    }
+    let registered = rustudio_core::texture_pack::variant_pack(pack_id);
+    let pack = if let Some(pack) = registered { pack } else {
+        let xml = rustudio_core::assets::public_cached(pack_id)?;
+        rustudio_core::texture_pack::parse_pack(&String::from_utf8_lossy(&xml)).map_err(|e| format!("pack {pack_id}: {e}"))?
+    };
+    let n = (LAYER_SIZE * LAYER_SIZE) as usize;
+    let get = |id: Option<u64>| -> Result<Option<rustudio_core::texture::Rgba>, String> {
+        id.map(image).transpose()
+    };
+    let colour = get(pack.color)?;
+    let normal = get(pack.normal)?;
+    let rough = get(pack.roughness)?;
+    let metal = get(pack.metalness)?;
+    let height = get(pack.height)?;
+    let emission = get(pack.emissive)?;
+    let found = [
+        colour.is_some(),
+        normal.is_some(),
+        rough.is_some(),
+        metal.is_some(),
+        height.is_some(),
+    ];
+    let [r, g, b] = rgb(color);
+    let mut albedo = vec![0u8; n * 4];
+    let mut surface = vec![0u8; n * 4];
+    let mut emissive = vec![0u8; n * 4];
+    for i in 0..n {
+        let px = |m: &Option<rustudio_core::texture::Rgba>, c: usize, none: u8| {
+            m.as_ref().map_or(none, |m| m.pixels[i * 4 + c])
+        };
+        albedo[i * 4] = px(&colour, 0, r);
+        albedo[i * 4 + 1] = px(&colour, 1, g);
+        albedo[i * 4 + 2] = px(&colour, 2, b);
+        albedo[i * 4 + 3] = px(&colour, 3, 255);
+        emissive[i * 4] = px(&emission, 0, 0);
+        surface[i * 4] = px(&normal, 0, 128);
+        surface[i * 4 + 1] = px(&normal, 1, 128);
+        surface[i * 4 + 2] = px(&rough, 0, 255);
+        surface[i * 4 + 3] = px(&metal, 0, 0);
+    }
+    Ok((found, Pixels {
+        albedo: mip_chain(&albedo, true),
+        surface: mip_chain(&surface, false),
+        height: height_chain(height.as_ref()),
+        emissive: mip_chain(&emissive, false).into_iter().step_by(4).collect(),
+        _held: Held::new(),
+    }))
+}
+
+/// Keep height linear through every mip; colour alpha remains a part tint mask.
+fn height_chain(image: Option<&rustudio_core::texture::Rgba>) -> Vec<u8> {
+    let n = (LAYER_SIZE * LAYER_SIZE) as usize;
+    let mut rgba = vec![128; n * 4];
+    if let Some(image) = image {
+        for (dst, src) in rgba.chunks_exact_mut(4).zip(image.pixels.chunks_exact(4)) {
+            dst.fill(src[0]);
+        }
+    }
+    mip_chain(&rgba, false).into_iter().step_by(4).collect()
+}
+
+/// Terrain uses height in albedo alpha, while parts use the original tint mask.
+/// Give this view a separate atlas cache key so sharing a pack cannot change parts.
+pub fn terrain_pack_maps(pack: u64, color: u32) -> Lookup {
+    pack_maps(terrain_key(pack), color)
+}
+
+/// `terrain_pack_maps` for a thumbnail (`pack_preview`).
+pub fn terrain_pack_preview(pack: u64, color: u32) -> Lookup {
+    pack_preview(terrain_key(pack), color)
+}
+
+fn terrain_key(pack: u64) -> u64 {
+    // Table packs come as Studio's KTX2 textures; MaterialVariant packs
+    // (registered, bit 62) only have their maps. The terrain view is built
+    // on the pack workers (it was a second copy of every pack's maps made
+    // and kept on the main thread).
+    let pack = if acr_enabled() && pack & (1u64 << 62) == 0 { pack | rustudio_core::texture_pack::ACR_BIT } else { pack };
+    pack | TERRAIN_BIT
+}
+
+/// LAYER_SIZE² RGBA8 plus its mips down to 1×1. `squared`: RGB averaged as
+/// squares (Studio squares colour texels), else plain averages.
+fn mip_chain(level0: &[u8], squared: bool) -> Vec<u8> {
+    let mut out = level0.to_vec();
+    let mut prev = level0.to_vec();
+    let mut size = LAYER_SIZE;
+    while size > 1 {
+        let half = size / 2;
+        let mut next = vec![0u8; (half * half * 4) as usize];
+        for y in 0..half {
+            for x in 0..half {
+                for c in 0..4 {
+                    let at = |dx: u32, dy: u32| {
+                        prev[(((y * 2 + dy) * size + x * 2 + dx) * 4) as usize + c] as f32 / 255.0
+                    };
+                    let v = [at(0, 0), at(1, 0), at(0, 1), at(1, 1)];
+                    let avg = if squared && c < 3 {
+                        (v.iter().map(|v| v * v).sum::<f32>() / 4.0).sqrt()
+                    } else {
+                        v.iter().sum::<f32>() / 4.0
+                    };
+                    next[((y * half + x) * 4) as usize + c] = (avg * 255.0 + 0.5) as u8;
+                }
+            }
+        }
+        out.extend_from_slice(&next);
+        prev = next;
+        size = half;
+    }
+    out
+}
+
+/// Byte offset and size of each mip level in a chain from [`mip_chain`].
+pub fn mip_levels() -> Vec<(usize, u32)> {
+    let mut v = Vec::new();
+    let (mut at, mut size) = (0usize, LAYER_SIZE);
+    loop {
+        v.push((at, size));
+        at += (size * size * 4) as usize;
+        if size == 1 {
+            break;
+        }
+        size /= 2;
+    }
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustudio_core::texture_pack::{is_variant_pack, parse_pack, register_terrain_variant, Pack};
+
+    /// Part MaterialVariants share the terrain variant registry; their ids
+    /// must be told apart from table packs (which keep their random uvOffset)
+    /// and from ACR-tagged ids.
+    #[test]
+    fn variant_pack_ids_are_recognised() {
+        let id = register_terrain_variant(Pack { color: Some(9942998923), normal: Some(9942998998),
+            roughness: Some(9942998661), tiling: 1.0, ..Default::default() });
+        assert!(is_variant_pack(id));
+        for e in PRE_2022.iter().chain(Y2022.iter()).chain(Y2022_4K.iter()) {
+            assert!(!is_variant_pack(e.pack) && !is_variant_pack(e.detail));
+            assert!(!is_variant_pack(e.pack | rustudio_core::texture_pack::ACR_BIT));
+        }
+    }
+
+    #[test]
+    fn terrain_height_mips_are_linear_and_use_red() {
+        let image = rustudio_core::texture::Rgba {
+            width: LAYER_SIZE, height: LAYER_SIZE,
+            pixels: [64, 190, 220, 255].repeat((LAYER_SIZE * LAYER_SIZE) as usize),
+        };
+        assert!(height_chain(Some(&image)).iter().all(|v| *v == 64));
+        assert!(height_chain(None).iter().all(|v| *v == 128));
+        let mut alternating = image;
+        for (i, pixel) in alternating.pixels.chunks_exact_mut(4).enumerate() {
+            pixel[0] = if i % 2 == 0 { 0 } else { 128 };
+        }
+        let chain = height_chain(Some(&alternating));
+        assert!(chain[(LAYER_SIZE * LAYER_SIZE) as usize..].iter().all(|v| *v == 64));
+    }
+
+    #[test]
+    fn tables_follow_studio() {
+        // Brick (848) in each table, as Studio's tables have it.
+        assert_eq!(entry(848, false).unwrap().pack, 7546650097);
+        assert_eq!(table(true)[11].material, 848);
+        assert_eq!(Y2022[11].pack, 9920482992);
+        // Pre-2022 Fabric's average colour is its colour map's mean.
+        assert_eq!(rgb(entry(1312, false).unwrap().color), [0x69, 0x68, 0x66]);
+        // The fallback darkening matches what offline Studio draws.
+        let c = fallback_albedo(1040, false);
+        assert!((c[0] - 0.39).abs() < 0.01 && (c[2] - 0.14).abs() < 0.01);
+        // Pre-2022 table colours are what offline Studio drew in the
+        // lighting calibration (mech::material_albedo, measured in an offline Studio).
+        for e in PRE_2022.iter() {
+            let (a, b) = (
+                fallback_albedo(e.material, false),
+                rustudio_core::mech::material_albedo(e.material),
+            );
+            for c in 0..3 {
+                assert!((a[c] - b[c]).abs() < 0.015, "{} {a:?} {b:?}", e.material);
+            }
+        }
+        for t in [&PRE_2022, &Y2022, &Y2022_4K] {
+            let mut seen = std::collections::HashSet::new();
+            assert!(t.iter().all(|e| seen.insert(e.material)));
+        }
+    }
+
+    #[test]
+    fn parses_texture_packs() {
+        let p = parse_pack(
+            "<roblox>\n  <texturepack_version>2</texturepack_version>\n  <usage version=\"1\">3</usage>\n  <alphamode>2</alphamode>\n  <tiling>1</tiling>\n  <color>9439631732</color>\n  <normal>9439632006</normal>\n  <roughness>9439632145</roughness>\n  <height>9439632299</height>\n</roblox>",
+        )
+        .unwrap();
+        assert_eq!(p.color, Some(9439631732));
+        assert_eq!(p.height, Some(9439632299));
+        assert_eq!(p.metalness, None);
+        assert_eq!(p.tiling, 1.0);
+        assert!(parse_pack("<roblox!binary").is_err());
+    }
+
+    #[test]
+    fn mip_chain_reaches_one_texel() {
+        let lv = mip_levels();
+        assert_eq!(lv.last().unwrap().1, 1);
+        let n = (LAYER_SIZE * LAYER_SIZE * 4) as usize;
+        let chain = mip_chain(&vec![200u8; n], true);
+        let (at, _) = *lv.last().unwrap();
+        assert_eq!(chain.len(), at + 4);
+        assert_eq!(chain[at], 200);
+    }
+}
+
+#[cfg(test)]
+mod net_tests {
+    use super::*;
+
+    /// Downloads one real pack (network; `cargo test -- --ignored`).
+    #[test]
+    #[ignore]
+    fn loads_brick_2022_4k() {
+        let e = entry(848, true).unwrap();
+        let t0 = std::time::Instant::now();
+        match wait(e, std::time::Duration::from_secs(300)) {
+            Lookup::Ready(m) => {
+                eprintln!(
+                    "brick {} in {:?}: found {:?}",
+                    m.pack,
+                    t0.elapsed(),
+                    m.found
+                );
+                assert!(m.found[0] && m.found[1]);
+            }
+            Lookup::Pending => panic!("still pending"),
+            Lookup::Unavailable(w) => panic!("{w}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod material_shading_contract {
+    #[test]
+    fn studio_neon_emission_transfer() {
+        // DefaultUnifiedNeonFS.3, before exposure and composition.
+        let shader = include_str!("shader.wgsl");
+        assert!(shader.contains("const NEON_GLOW: f32 = 13.286025;"));
+        assert!(shader.contains("c = base * base * NEON_GLOW;"));
+        for (color, expected) in [(0.0_f32, 0.0_f32), (0.5, 0.83037656), (1.0, 13.286025)] {
+            let studio = 4.0 * (1.35 * color).powi(4);
+            assert!((studio - expected).abs() < 0.00001);
+        }
+    }
+}
+
+/// A loaded pack's mean colour (sRGB unit RGB), averaged in linear light
+/// (γ 2.2) over its top level. Studio's decoration grass takes its blade
+/// base colour from the grass layer's mean albedo: the 2022 Grass colour map
+/// (9920551868) averages to (195.6, 195.1, 188.3) this way, against the
+/// table's avgAlbedo2022 (196, 196, 189) and the captured blade base
+/// (194, 196, 188) (checks/grass-parity/findings.txt). A MaterialVariant on
+/// Grass has no table entry, so its own ColorMap's mean is the base.
+pub fn mean_albedo(maps: &Maps) -> [f32; 3] {
+    maps.mean
+}
+
+fn top_level_mean(albedo: &[u8]) -> [f32; 3] {
+    let n = (LAYER_SIZE * LAYER_SIZE) as usize;
+    static LUT: OnceLock<Vec<f64>> = OnceLock::new();
+    let lut = LUT.get_or_init(|| (0..256).map(|v| (v as f64 / 255.0).powf(2.2)).collect());
+    let mut sum = [0f64; 3];
+    for px in albedo[..(n * 4).min(albedo.len())].chunks_exact(4) {
+        for c in 0..3 {
+            sum[c] += lut[px[c] as usize];
+        }
+    }
+    let count = (albedo.len() / 4).min(n).max(1) as f64;
+    sum.map(|s| (s / count).powf(1.0 / 2.2) as f32)
+}
+
+// ------------------------------------------------- terrain packs as Studio has them
+//
+// Studio draws terrain from the representations assetdelivery transcodes each
+// TexturePack into (asked for with assetType TexturePack, a
+// contentRepresentationPriorityList of `ktx2` / `7rdo` and
+// doNotFallbackToBaselineRepresentation): three KTX2 textures, BC1 / BC3 with
+// zstd supercompression, 512² (pre-2022 packs) or 1024² (2022 packs), full
+// mip chains. Studio fills its 512² terrain arrays from them
+// ("Terrain TextureArray 512x512, arraySize: 37, mip: 10" in its log):
+// - fidelity AkA= (02 40): albedo as YCoCg, R = Co + ½, G = Y, B = Cg + ½;
+// - fidelity IkA= (22 40): normal, X in A, Y in G (same axes as the pack's
+//   normal map);
+// - fidelity QkA= (42 40): G roughness, B emissive mask, A height.
+// Their albedo is not the pack's colour map: ~7 levels darker on Brick.
+// The raw maps stay the fallback (offline without a cache, or
+// RUSTUDIO_TERRAIN_ACR=0).
+
+
+/// The three representations: (priority list, base64 of
+/// [{"format":"ktx2","majorVersion":"7rdo","fidelity":…}], fidelity bytes).
+const ACR_REPS: [(&str, &str); 3] = [
+    ("W3siZm9ybWF0Ijoia3R4MiIsIm1ham9yVmVyc2lvbiI6IjdyZG8iLCJmaWRlbGl0eSI6IkFrQT0ifV0=", "0240"),
+    ("W3siZm9ybWF0Ijoia3R4MiIsIm1ham9yVmVyc2lvbiI6IjdyZG8iLCJmaWRlbGl0eSI6IklrQT0ifV0=", "2240"),
+    ("W3siZm9ybWF0Ijoia3R4MiIsIm1ham9yVmVyc2lvbiI6IjdyZG8iLCJmaWRlbGl0eSI6IlFrQT0ifV0=", "4240"),
+];
+
+fn acr_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("RUSTUDIO_TERRAIN_ACR").is_ok_and(|v| v == "0"))
+}
+
+/// One KTX2 representation of a pack: the disk cache, else assetdelivery
+/// (anonymous, as for public assets).
+fn acr_bytes(pack: u64, rep: usize) -> Result<Vec<u8>, String> {
+    let (list, fid) = ACR_REPS[rep];
+    let path = rustudio_core::assets::cache_dir().join("assets").join(format!("{pack}_acr_ktx2-7rdo-{fid}.ktx2"));
+    if let Ok(b) = std::fs::read(&path) {
+        return Ok(b);
+    }
+    use std::io::Read;
+    let agent = rustudio_account::api::agent();
+    let body = format!(
+        "[{{\"assetId\":{pack},\"contentRepresentationPriorityList\":\"{list}\",\
+         \"doNotFallbackToBaselineRepresentation\":\"true\",\"assetType\":\"TexturePack\",\"requestId\":\"0\"}}]"
+    );
+    let location = |text: &str| -> Option<String> {
+        let v: serde_json::Value = serde_json::from_str(text).ok()?;
+        v.pointer("/0/location")?.as_str().map(str::to_string)
+    };
+    // Anonymous first (Studio's own packs are public); a MaterialVariant's
+    // pack is usually served only to signed-in accounts (401 anonymously),
+    // so then ask as the session does, in the open place's context.
+    let mut r = agent
+        .post("https://assetdelivery.roblox.com/v1/assets/batch")
+        .header("Content-Type", "application/json")
+        .send(body.as_str())
+        .map_err(|e| format!("pack {pack} ktx2: {e}"))?;
+    let mut text = r.body_mut().read_to_string().map_err(|e| format!("pack {pack} ktx2: {e}"))?;
+    let mut loc = location(&text);
+    if loc.is_none() && rustudio_core::assets::wait_for_session(std::time::Duration::from_secs(30)) {
+        let session = rustudio_core::assets::session_client()
+            .and_then(|c| Some(c.lock().ok()?.as_ref()?.session.downloader()));
+        if let Some(session) = session {
+            let place = rustudio_account::session::PLACE_CONTEXT.load(Ordering::Relaxed).to_string();
+            let extra: Vec<(&str, &str)> = if place != "0" { vec![("Roblox-Place-Id", place.as_str())] } else { Vec::new() };
+            match session.post_csrf_with("https://assetdelivery.roblox.com/v1/assets/batch", "application/json", body.as_bytes(), &extra) {
+                Ok((_, t)) => { loc = location(&t); text = t; }
+                Err(e) => text = e.to_string(),
+            }
+        }
+    }
+    let loc = loc.ok_or_else(|| format!("pack {pack} ktx2: no location ({})", text.chars().take(120).collect::<String>()))?;
+    let mut r = agent.get(&loc).header("Accept-Encoding", "gzip").call().map_err(|e| format!("pack {pack} ktx2: {e}"))?;
+    let mut bytes = Vec::new();
+    r.body_mut().with_config().limit(64 << 20).reader().read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(&bytes[..]).read_to_end(&mut out).map_err(|e| e.to_string())?;
+        bytes = out;
+    }
+    if !bytes.starts_with(KTX2_MAGIC) {
+        return Err(format!("pack {pack} ktx2: not a KTX2 file"));
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, &bytes);
+    Ok(bytes)
+}
+
+const KTX2_MAGIC: &[u8] = b"\xabKTX 20\xbb\r\n\x1a\n";
+
+/// A KTX2 file's mip levels as RGBA8 (square 2D BC1 / BC3, zstd or none).
+pub fn ktx2_levels(d: &[u8]) -> Result<Vec<(u32, Vec<u8>)>, String> {
+    let u32_at = |o: usize| d.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).ok_or("short KTX2");
+    let u64_at = |o: usize| d.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap())).ok_or("short KTX2");
+    if !d.starts_with(KTX2_MAGIC) {
+        return Err("not a KTX2 file".into());
+    }
+    let (format, width, levels, scheme) = (u32_at(12)?, u32_at(20)?, u32_at(40)?.max(1), u32_at(44)?);
+    let block: fn(&[u8], &mut [[u8; 4]; 16]) = match format {
+        131..=134 => bc1_block,
+        137 | 138 => bc3_block,
+        f => return Err(format!("KTX2 format {f} isn't BC1 / BC3")),
+    };
+    let stride = if format <= 134 { 8 } else { 16 };
+    let mut out = Vec::new();
+    for l in 0..levels as usize {
+        let (off, len, raw) = (u64_at(80 + l * 24)? as usize, u64_at(88 + l * 24)? as usize, u64_at(96 + l * 24)? as usize);
+        let blob = d.get(off..off + len).ok_or("short KTX2 level")?;
+        let data = match scheme {
+            0 => blob.to_vec(),
+            2 => zstd::bulk::decompress(blob, raw).map_err(|e| format!("KTX2 zstd: {e}"))?,
+            s => return Err(format!("KTX2 supercompression {s}")),
+        };
+        let size = (width >> l).max(1);
+        let blocks = size.div_ceil(4) as usize;
+        let mut rgba = vec![0u8; (size * size * 4) as usize];
+        let mut px = [[0u8; 4]; 16];
+        for by in 0..blocks {
+            for bx in 0..blocks {
+                let at = (by * blocks + bx) * stride;
+                block(data.get(at..at + stride).ok_or("short KTX2 blocks")?, &mut px);
+                for (i, p) in px.iter().enumerate() {
+                    let (x, y) = (bx * 4 + i % 4, by * 4 + i / 4);
+                    if x < size as usize && y < size as usize {
+                        let o = (y * size as usize + x) * 4;
+                        rgba[o..o + 4].copy_from_slice(p);
+                    }
+                }
+            }
+        }
+        out.push((size, rgba));
+    }
+    Ok(out)
+}
+
+fn rgb565(c: u16) -> [u32; 3] {
+    let (r, g, b) = ((c >> 11) as u32 & 31, (c >> 5) as u32 & 63, c as u32 & 31);
+    [(r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2)]
+}
+
+/// A BC1 block's colour (RGB block: the 3-colour mode's fourth entry is black).
+fn bc1_colors(b: &[u8], four: bool, px: &mut [[u8; 4]; 16]) {
+    let (c0, c1) = (u16::from_le_bytes([b[0], b[1]]), u16::from_le_bytes([b[2], b[3]]));
+    let (a, z) = (rgb565(c0), rgb565(c1));
+    let mix = |wa: u32, wz: u32, d: u32| [0, 1, 2].map(|i| ((a[i] * wa + z[i] * wz + d / 2) / d) as u8);
+    let pal: [[u8; 3]; 4] = if four || c0 > c1 {
+        [a.map(|v| v as u8), z.map(|v| v as u8), mix(2, 1, 3), mix(1, 2, 3)]
+    } else {
+        [a.map(|v| v as u8), z.map(|v| v as u8), mix(1, 1, 2), [0, 0, 0]]
+    };
+    let idx = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+    for (i, p) in px.iter_mut().enumerate() {
+        let c = pal[((idx >> (2 * i)) & 3) as usize];
+        p[..3].copy_from_slice(&c);
+    }
+}
+
+fn bc1_block(b: &[u8], px: &mut [[u8; 4]; 16]) {
+    bc1_colors(b, false, px);
+    px.iter_mut().for_each(|p| p[3] = 255);
+}
+
+fn bc3_block(b: &[u8], px: &mut [[u8; 4]; 16]) {
+    let (a0, a1) = (b[0] as u32, b[1] as u32);
+    let mut pal = [0u8; 8];
+    pal[0] = a0 as u8;
+    pal[1] = a1 as u8;
+    if a0 > a1 {
+        for i in 1..7u32 {
+            pal[i as usize + 1] = (((7 - i) * a0 + i * a1 + 3) / 7) as u8;
+        }
+    } else {
+        for i in 1..5u32 {
+            pal[i as usize + 1] = (((5 - i) * a0 + i * a1 + 2) / 5) as u8;
+        }
+        pal[6] = 0;
+        pal[7] = 255;
+    }
+    let bits = b[2..8].iter().rev().fold(0u64, |acc, &x| (acc << 8) | x as u64);
+    bc1_colors(&b[8..16], true, px);
+    for (i, p) in px.iter_mut().enumerate() {
+        p[3] = pal[((bits >> (3 * i)) & 7) as usize];
+    }
+}
+
+/// The level of a KTX2 chain for a `LAYER_SIZE >> k` texture: the chain's
+/// own level, or its top level repeated up (nearest) when the KTX2 is smaller.
+fn acr_level(levels: &[(u32, Vec<u8>)], size: u32) -> Vec<u8> {
+    if let Some((_, px)) = levels.iter().find(|(s, _)| *s == size) {
+        return px.clone();
+    }
+    let (top, px) = &levels[0];
+    if size > *top {
+        let k = (size / top) as usize;
+        let mut out = vec![0u8; (size * size * 4) as usize];
+        for y in 0..size as usize {
+            for x in 0..size as usize {
+                let s = ((y / k) * *top as usize + x / k) * 4;
+                out[(y * size as usize + x) * 4..][..4].copy_from_slice(&px[s..s + 4]);
+            }
+        }
+        return out;
+    }
+    // A chain stopping short of 1×1: average the last level down.
+    let (mut s, mut cur) = levels.last().map(|(s, p)| (*s, p.clone())).unwrap();
+    while s > size {
+        let h = s / 2;
+        let mut next = vec![0u8; (h * h * 4) as usize];
+        for y in 0..h as usize {
+            for x in 0..h as usize {
+                for c in 0..4 {
+                    let at = |dx: usize, dy: usize| cur[((y * 2 + dy) * s as usize + x * 2 + dx) * 4 + c] as u32;
+                    next[(y * h as usize + x) * 4 + c] = ((at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1) + 2) / 4) as u8;
+                }
+            }
+        }
+        cur = next;
+        s = h;
+    }
+    cur
+}
+
+/// A terrain pack's maps from its KTX2 representations, laid out like
+/// `build`'s (albedo sRGB RGB, surface normal X / Y / roughness / 0, linear
+/// height and emissive), one mip chain level per KTX2 level.
+fn build_acr(pack: u64) -> Result<([bool; 5], Pixels), String> {
+    let reps = (0..3).map(|i| acr_bytes(pack, i).and_then(|b| ktx2_levels(&b)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (mut albedo, mut surface, mut height, mut emissive) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    // Pre-2022 packs come as YCoCg, 2022 packs as RGB + tint mask.
+    let ycocg = rustudio_core::terrain_mat::pre2022_pack(pack);
+    for (_, size) in mip_levels() {
+        let [a, n, s] = [0, 1, 2].map(|i| acr_level(&reps[i], size));
+        for ((a, n), s) in a.chunks_exact(4).zip(n.chunks_exact(4)).zip(s.chunks_exact(4)) {
+            if ycocg {
+                let (co, y, cg) = (a[0] as f32 / 255.0 - 0.5, a[1] as f32 / 255.0, a[2] as f32 / 255.0 - 0.5);
+                let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                albedo.extend_from_slice(&[q(y - cg + co), q(y + cg), q(y - cg - co), 255]);
+            } else {
+                albedo.extend_from_slice(a);
+            }
+            surface.extend_from_slice(&[n[3], n[1], s[1], 0]);
+            height.push(s[3]);
+            emissive.push(s[2]);
+        }
+    }
+    Ok(([true, true, true, false, true], Pixels { albedo, surface, height, emissive, _held: Held::new() }))
+}
+
+#[cfg(test)]
+mod ktx2_tests {
+    use super::*;
+
+    /// A one-level 4×4 KTX2 holding one block, uncompressed.
+    fn ktx2(format: u32, block: &[u8]) -> Vec<u8> {
+        let mut d = KTX2_MAGIC.to_vec();
+        for v in [format, 1, 4, 4, 0, 0, 1, 1, 0] {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        d.resize(80, 0);
+        for v in [104u64, block.len() as u64, block.len() as u64] {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        d.extend_from_slice(block);
+        d
+    }
+
+    #[test]
+    fn bc1_and_bc3_blocks_decode() {
+        // BC1: c0 white, c1 black, four-colour mode; texels 0,1,2,3 cycling.
+        let bc1 = [0xff, 0xff, 0, 0, 0b1110_0100, 0b1110_0100, 0b1110_0100, 0b1110_0100];
+        let l = ktx2_levels(&ktx2(131, &bc1)).unwrap();
+        let px = &l[0].1;
+        assert_eq!(&px[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&px[4..8], &[0, 0, 0, 255]);
+        assert_eq!(&px[8..12], &[170, 170, 170, 255]);
+        assert_eq!(&px[12..16], &[85, 85, 85, 255]);
+        // BC3: alpha 200 / 100 (8-value mode), every index 1 → 100; colour as above.
+        let mut bc3 = vec![200, 100];
+        bc3.extend_from_slice(&[0b0100_1001, 0b1001_0010, 0b0010_0100, 0b0100_1001, 0b1001_0010, 0b0010_0100]);
+        bc3.extend_from_slice(&bc1);
+        let l = ktx2_levels(&ktx2(137, &bc3)).unwrap();
+        assert!(l[0].1.chunks_exact(4).all(|p| p[3] == 100));
+        assert_eq!(&l[0].1[8..11], &[170, 170, 170]);
+    }
+
+    #[test]
+    fn acr_levels_fill_the_layer_chain() {
+        let levels = vec![(2u32, vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160]), (1, vec![1, 2, 3, 4])];
+        // Bigger than the chain: nearest repeat of the top level.
+        let up = acr_level(&levels, 4);
+        assert_eq!(&up[0..4], &[10, 20, 30, 40]);
+        assert_eq!(&up[4..8], &[10, 20, 30, 40]);
+        assert_eq!(&up[8..12], &[50, 60, 70, 80]);
+        // Its own level when it has one.
+        assert_eq!(acr_level(&levels, 1), vec![1, 2, 3, 4]);
+    }
+}
